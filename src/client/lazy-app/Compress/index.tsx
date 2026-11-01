@@ -2,16 +2,7 @@ import { h, Component } from 'preact';
 
 import * as style from './style.css';
 import 'add-css:./style.css';
-import {
-  blobToImg,
-  blobToText,
-  builtinDecode,
-  sniffMimeType,
-  canDecodeImageType,
-  abortable,
-  assertSignal,
-  ImageMimeTypes,
-} from '../util';
+import { blobToImg, blobToText, abortable, assertSignal } from '../util';
 import {
   PreprocessorState,
   ProcessorState,
@@ -29,7 +20,8 @@ import { cleanMerge, cleanSet } from '../util/clean-modify';
 import './custom-els/MultiPanel';
 import Results from './Results';
 import WorkerBridge from '../worker-bridge';
-import { resize } from 'features/processors/resize/client';
+import { decodeImage, processImage, compressImage } from './pipeline';
+import { createZip } from '../util/zip';
 import type SnackBarElement from 'shared/custom-els/snack-bar';
 import { drawableToImageData } from '../util/canvas';
 
@@ -42,7 +34,7 @@ export interface SourceImage {
   vectorImage?: HTMLImageElement;
 }
 
-interface SideSettings {
+export interface SideSettings {
   processorState: ProcessorState;
   encoderState?: EncoderState;
 }
@@ -59,11 +51,14 @@ interface Side {
 
 interface Props {
   file: File;
+  files: File[];
   showSnack: SnackBarElement['showSnackbar'];
   onBack: () => void;
 }
 
 interface State {
+  /** Batch progress: files done of total, undefined when not running */
+  batch?: { done: number; total: number };
   source?: SourceImage;
   sides: [Side, Side];
   /** Source image load */
@@ -88,42 +83,6 @@ interface LoadingFileInfo {
   filename?: string;
 }
 
-async function decodeImage(
-  signal: AbortSignal,
-  blob: Blob,
-  workerBridge: WorkerBridge,
-): Promise<ImageData> {
-  assertSignal(signal);
-  const mimeType = await abortable(signal, sniffMimeType(blob));
-  const canDecode = await abortable(signal, canDecodeImageType(mimeType));
-
-  try {
-    if (!canDecode) {
-      if (mimeType === 'image/avif') {
-        return await workerBridge.avifDecode(signal, blob);
-      }
-      if (mimeType === 'image/webp') {
-        return await workerBridge.webpDecode(signal, blob);
-      }
-      if (mimeType === 'image/jxl') {
-        return await workerBridge.jxlDecode(signal, blob);
-      }
-      if (mimeType === 'image/webp2') {
-        return await workerBridge.wp2Decode(signal, blob);
-      }
-      if (mimeType === 'image/qoi') {
-        return await workerBridge.qoiDecode(signal, blob);
-      }
-    }
-    // Otherwise fall through and try built-in decoding for a laugh.
-    return await builtinDecode(signal, blob);
-  } catch (err) {
-    if (err instanceof Error && err.name === 'AbortError') throw err;
-    console.log(err);
-    throw Error("Couldn't decode image");
-  }
-}
-
 async function preprocessImage(
   signal: AbortSignal,
   data: ImageData,
@@ -142,56 +101,6 @@ async function preprocessImage(
   }
 
   return processedData;
-}
-
-async function processImage(
-  signal: AbortSignal,
-  source: SourceImage,
-  processorState: ProcessorState,
-  workerBridge: WorkerBridge,
-): Promise<ImageData> {
-  assertSignal(signal);
-  let result = source.preprocessed;
-
-  if (processorState.resize.enabled) {
-    result = await resize(signal, source, processorState.resize, workerBridge);
-  }
-  if (processorState.quantize.enabled) {
-    result = await workerBridge.quantize(
-      signal,
-      result,
-      processorState.quantize,
-    );
-  }
-  return result;
-}
-
-async function compressImage(
-  signal: AbortSignal,
-  image: ImageData,
-  encodeData: EncoderState,
-  sourceFilename: string,
-  workerBridge: WorkerBridge,
-): Promise<File> {
-  assertSignal(signal);
-
-  const encoder = encoderMap[encodeData.type];
-  const compressedData = await encoder.encode(
-    signal,
-    workerBridge,
-    image,
-    // The type of encodeData.options is enforced via the previous line
-    encodeData.options as any,
-  );
-
-  // This type ensures the image mimetype is consistent with our mimetype sniffer
-  const type: ImageMimeTypes = encoder.meta.mimeType;
-
-  return new File(
-    [compressedData],
-    sourceFilename.replace(/.[^.]*$/, `.${encoder.meta.extension}`),
-    { type },
-  );
 }
 
 function stateForNewSourceData(state: State): State {
@@ -264,6 +173,16 @@ function processorStateEquivalent(a: ProcessorState, b: ProcessorState) {
   return true;
 }
 
+/** Returns `name`, suffixed with ` (n)` before the extension if already used. */
+function uniqueName(name: string, used: Set<string>): string {
+  let candidate = name;
+  for (let i = 2; used.has(candidate); i++) {
+    candidate = name.replace(/(\.[^.]*)?$/, ` (${i})$1`);
+  }
+  used.add(candidate);
+  return candidate;
+}
+
 const loadingIndicator = '⏳ ';
 
 const originalDocumentTitle = document.title;
@@ -318,6 +237,7 @@ export default class Compress extends Component<Props, State> {
   };
 
   private readonly encodeCache = new ResultCache();
+  private readonly batchAbortController = new AbortController();
   // One for each side
   private readonly workerBridges = [new WorkerBridge(), new WorkerBridge()];
   /** Abort controller for actions that impact both sites, like source image decoding and preprocessing */
@@ -335,6 +255,61 @@ export default class Compress extends Component<Props, State> {
 
     import('../sw-bridge').then(({ mainAppLoaded }) => mainAppLoaded());
   }
+
+  private onProcessAllClick = async () => {
+    if (this.state.batch) return;
+    const { files } = this.props;
+    const settings = this.state.sides[1].latestSettings;
+    const signal = this.batchAbortController.signal;
+    const workerBridge = this.workerBridges[1];
+    this.setState({ batch: { done: 0, total: files.length } });
+
+    try {
+      const entries: { name: string; data: Uint8Array }[] = [];
+      const usedNames = new Set<string>();
+      for (const [i, file] of files.entries()) {
+        let output = file;
+        if (settings.encoderState) {
+          const decoded = await decodeImage(signal, file, workerBridge);
+          const source: SourceImage = { file, decoded, preprocessed: decoded };
+          const processed = await processImage(
+            signal,
+            source,
+            settings.processorState,
+            workerBridge,
+          );
+          output = await compressImage(
+            signal,
+            processed,
+            settings.encoderState,
+            file.name,
+            workerBridge,
+          );
+        }
+        entries.push({
+          name: uniqueName(output.name, usedNames),
+          data: new Uint8Array(await output.arrayBuffer()),
+        });
+        this.setState({ batch: { done: i + 1, total: files.length } });
+      }
+
+      const url = URL.createObjectURL(createZip(entries));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'squoosh.zip';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      this.props.showSnack(`Downloaded ${entries.length} images as ZIP`, {
+        timeout: 3000,
+        actions: ['dismiss'],
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return;
+      this.props.showSnack(`Batch processing error: ${err}`);
+    } finally {
+      if (!signal.aborted) this.setState({ batch: undefined });
+    }
+  };
 
   private onMobileWidthChange = () => {
     this.setState({ mobileView: this.widthQuery.matches });
@@ -389,6 +364,7 @@ export default class Compress extends Component<Props, State> {
   }
 
   componentWillUnmount(): void {
+    this.batchAbortController.abort();
     updateDocumentTitle({ loading: false });
     this.widthQuery.removeListener(this.onMobileWidthChange);
     this.mainAbortController.abort();
@@ -919,8 +895,8 @@ export default class Compress extends Component<Props, State> {
   }
 
   render(
-    { onBack }: Props,
-    { loading, sides, source, mobileView, preprocessorState }: State,
+    { onBack, files }: Props,
+    { loading, sides, source, mobileView, preprocessorState, batch }: State,
   ) {
     const [leftSide, rightSide] = sides;
     const [leftImageData, rightImageData] = sides.map((i) => i.data);
@@ -994,6 +970,17 @@ export default class Compress extends Component<Props, State> {
             />
           </svg>
         </button>
+        {files.length > 1 && (
+          <button
+            class={style.processAll}
+            onClick={this.onProcessAllClick}
+            disabled={!!batch}
+          >
+            {batch
+              ? `Processing ${batch.done} / ${batch.total}…`
+              : `Process all ${files.length} images`}
+          </button>
+        )}
         {mobileView ? (
           <div class={style.options}>
             <multi-panel class={style.multiPanel} open-one-only>

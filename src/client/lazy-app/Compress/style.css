@@ -140,6 +140,26 @@
   }
 }
 
+.process-all {
+  composes: unbutton from global;
+  position: relative;
+  grid-area: header;
+  justify-self: end;
+  align-self: start;
+  margin: 20px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  background: var(--hot-pink);
+  color: #fff;
+  font-size: 1.2rem;
+  cursor: pointer;
+
+  &:disabled {
+    opacity: 0.6;
+    cursor: wait;
+  }
+}
+
 .back-blob {
   fill: var(--hot-pink);
   opacity: 0.77;
